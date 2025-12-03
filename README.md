@@ -217,6 +217,193 @@ If you are running Open WebUI in an offline environment, you can set the `HF_HUB
 export HF_HUB_OFFLINE=1
 ```
 
+## Crypto Pond 知识库 RAG 系统 🚀
+
+本项目基于 Open WebUI 扩展，集成了 **Snowflake Cortex Search** 和 **OpenAI GPT-4.1-mini**，为 Crypto Pond 平台提供智能知识库问答服务。
+
+### 技术选型说明
+
+本次架构设计基于支持 **3 个独立项目（Project）**（约 **50 个以内的内部用户**）的使用场景。选用 **Open WebUI** 作为前端多用户聊天界面方案，主要考虑：
+
+- 前后端结合且开源、可自部署，易于二次开发与集成
+- 原生支持多用户、工作区（Workspace）与 API 接口扩展
+- 技术栈为 **Python + FastAPI + React**
+
+> **注意**：Open WebUI 并非唯一或最佳方案。由于其后端基于 Python + FastAPI，而团队当前后端工程主要是 **Go 相关**，因此在未来可以根据项目增长和性能需求收敛技术栈，评估替换或自研基于 Go 的多用户 Chat 平台，或引入更成熟的企业级开源方案。本方案旨在提供一个 **可快速落地验证的基线架构（MVP）**。
+
+### 相关文档
+
+- **Open WebUI**: [https://docs.openwebui.com/](https://docs.openwebui.com/)
+- **Snowflake Cortex Search Service**: [https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-search/query-cortex-search-service](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-search/query-cortex-search-service)
+
+### 系统架构
+
+```
+┌────────────────────────────┐
+│          用户前端          │
+│ cryptopond.xyz（嵌入按钮） │
+└─────────────┬──────────────┘
+              │ user_id / email
+              ▼
+┌────────────────────────────┐
+│        Open WebUI 层       │
+│ - 承载聊天界面               │
+│ - 后端交互                  │
+└─────────────┬──────────────┘
+              │
+              ▼
+┌────────────────────────────┐
+│  授权验证 & 中间服务层     │
+│ - 校验 user_id 是否属于审核项目成员 │
+│ - 生成会话上下文           │
+│ - 调用搜索与生成模块       │
+└─────────────┬──────────────┘
+              │
+              ▼
+┌────────────────────────────────────┐
+│       数据与智能处理层（RAG）      │
+│                                    │
+│ ┌──────────────┐   ┌──────────────┐ │
+│ │ Snowflake     │   │ OpenAI GPT‑4.1-mini │ │
+│ │ Cortex Search │   │ (LLM生成回答)       │ │
+│ └──────────────┘   └──────────────┘ │
+│   ↑ 向量检索结果     ↓ 上下文生成回答     │
+└────────────────────────────────────┘
+              │
+              ▼
+┌────────────────────────────┐
+│        Open WebUI 前端     │
+│ 展示回答、引用、上下文来源 │
+└────────────────────────────┘
+```
+
+### 数据流程
+
+| 流程阶段 | 输入 | 输出 | 说明 |
+| --- | --- | --- | --- |
+| ① 用户访问 | user_id / email | — | 用户在 cryptopond.xyz 触发 Open WebUI |
+| ② 授权验证 | user_id | 是否有权限 | 后端查询业务库确认是否为过审项目的成员 |
+| ③ 语义检索 | user_id + 用户问题 | Top 4 语义匹配文档 | 调用 Snowflake Cortex Search 检索知识片段 |
+| ④ 上下文拼接 | 检索结果 + 用户问题 | prompt context | 将结果组织成系统提示上下文 |
+| ⑤ 模型生成 | prompt context | 回答文本 | GPT‑4.1-mini 生成自然语言回答 |
+| ⑥ 前端展示 | 回答 + 来源信息 | 可视化展示 | Open WebUI 展示回答与引用来源 |
+
+### 已实现功能 ✅
+
+1. **Snowflake Cortex Search 集成** - 已完成
+   - `backend/open_webui/utils/snowflake_cortex.py` 已实现搜索功能
+   - `backend/open_webui/routers/openai.py` 已集成到聊天流程
+
+2. **搜索结果合并到 Prompt** - 已完成
+   - `enhance_payload_with_snowflake_search()` 函数已实现
+
+3. **知识库标记** - 已完成
+   - 流式和非流式响应都已添加标记
+
+4. **基础用户认证** - Open WebUI 自带
+   - `get_verified_user` 依赖已存在
+
+### 待实现功能 ❌
+
+#### 高优先级（核心功能）
+
+1. **项目成员验证服务层**
+   - 位置: `backend/open_webui/routers/auths.py` 或新建 `backend/open_webui/routers/project_auth.py`
+   - 需要实现:
+     - 创建 API 端点验证 user_id/email 是否为审核项目成员
+     - 集成业务数据库（需要确定数据库类型和连接方式）
+     - 实现项目成员查询逻辑
+     - 添加中间件在请求处理前进行验证
+
+2. **用户过滤功能**
+   - 位置: `backend/open_webui/utils/snowflake_cortex.py`
+   - 需要实现:
+     - 修改 `search_snowflake_cortex()` 函数，接受 `user_id` 或 `email` 参数
+     - 在 Snowflake 查询中添加用户过滤条件（如果 Snowflake 表中有用户字段）
+     - 或者在后处理阶段过滤结果
+
+3. **来源信息提取和传递**
+   - 位置: `backend/open_webui/utils/snowflake_cortex.py` 和 `backend/open_webui/routers/openai.py`
+   - 需要实现:
+     - 修改 `search_snowflake_cortex()` 返回结构化数据（包含来源信息）
+     - 在响应中添加 `sources` 字段（参考 Open WebUI 现有的 citations 格式）
+     - 确保前端能正确解析和显示来源
+
+#### 中优先级（增强功能）
+
+4. **前端嵌入集成**
+   - 位置: 新建 `src/lib/components/embed/` 或修改现有组件
+   - 需要实现:
+     - 创建嵌入式聊天组件（iframe 或 widget）
+     - 实现从 cryptopond.xyz 传递 user_id/email 的机制
+     - 处理跨域认证和会话管理
+     - 样式适配（嵌入式场景）
+
+5. **环境变量和配置**
+   - 位置: `backend/open_webui/env.py` 和 `.env.example`
+   - 需要添加:
+     - `PROJECT_DB_URL` - 业务数据库连接字符串
+     - `PROJECT_DB_TYPE` - 数据库类型（MySQL/PostgreSQL/MongoDB等）
+     - `ENABLE_PROJECT_AUTH` - 是否启用项目成员验证
+     - `CRYPTOPOND_EMBED_SECRET` - 嵌入式认证密钥（可选）
+
+#### 低优先级（优化功能）
+
+6. **日志和监控**
+   - 位置: `backend/open_webui/routers/openai.py`
+   - 需要添加:
+     - 项目成员验证的日志记录
+     - 用户过滤的日志记录
+     - 来源信息提取的日志记录
+
+### 技术决策点
+
+在开始实现前，需要确认以下信息：
+
+1. **业务数据库类型**: 需要确认是 MySQL、PostgreSQL 还是其他
+2. **项目成员表结构**: 需要确认表名、字段名（user_id, email, project_id 等）
+3. **Snowflake 表结构**: 需要确认是否有用户字段可用于过滤
+4. **嵌入式认证方式**: JWT token、API key 还是其他方式
+5. **来源信息格式**: 需要确认 Snowflake 返回的数据结构，如何提取来源
+
+### 配置说明
+
+#### Snowflake Cortex Search 配置
+
+在 `.env` 文件中配置以下环境变量：
+
+```bash
+# Snowflake 连接配置
+SNOWFLAKE_ACCOUNT=your_account
+SNOWFLAKE_USER=your_user
+SNOWFLAKE_PASSWORD=your_password
+SNOWFLAKE_PRIVATE_KEY_PEM=your_private_key  # 可选，优先使用私钥认证
+SNOWFLAKE_ROLE=your_role
+SNOWFLAKE_WAREHOUSE=your_warehouse
+SNOWFLAKE_DATABASE=your_database
+SNOWFLAKE_SCHEMA=your_schema
+SNOWFLAKE_CORTEX_SERVICE=your_cortex_service_name
+
+# RAG 相关配置
+OPENAI_MODEL=gpt-4.1-mini
+RAG_CONTEXT_LIMIT=4000
+ENABLE_USER_EMAIL_FILTER=false
+```
+
+#### 项目成员验证配置（待实现）
+
+```bash
+# 项目成员验证配置
+ENABLE_PROJECT_AUTH=true
+PROJECT_DB_URL=mysql://user:password@host:port/database
+PROJECT_DB_TYPE=mysql  # 或 postgresql, http_api
+PROJECT_MEMBERS_TABLE=project_members
+PROJECT_MEMBERS_USER_ID_COLUMN=user_id
+PROJECT_MEMBERS_EMAIL_COLUMN=email
+PROJECT_MEMBERS_STATUS_COLUMN=status
+PROJECT_MEMBERS_APPROVED_STATUS=approved
+```
+
 ## What's Next? 🌟
 
 Discover upcoming features on our roadmap in the [Open WebUI Documentation](https://docs.openwebui.com/roadmap/).
