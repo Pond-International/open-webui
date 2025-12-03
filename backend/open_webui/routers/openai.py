@@ -53,7 +53,7 @@ from open_webui.utils.headers import include_user_info_headers
 
 
 log = logging.getLogger(__name__)
-log.setLevel(SRC_LOG_LEVELS["OPENAI"])
+log.setLevel(logging.WARNING)
 
 # 导入 Snowflake Cortex Search
 try:
@@ -104,7 +104,7 @@ async def cleanup_response(
         await session.close()
 
 
-async def enhance_payload_with_snowflake_search(payload: dict) -> dict:
+async def enhance_payload_with_snowflake_search(payload: dict) -> tuple[dict, bool]:
     """
     使用 Snowflake Cortex Search 增强 payload，将检索结果合并到用户消息中
     
@@ -112,13 +112,17 @@ async def enhance_payload_with_snowflake_search(payload: dict) -> dict:
         payload: OpenAI API 请求的 payload
         
     Returns:
-        增强后的 payload
+        (增强后的 payload, 是否使用了 Snowflake Cortex Search)
     """
+    log.info(f"enhance_payload_with_snowflake_search called, SNOWFLAKE_CORTEX_AVAILABLE={SNOWFLAKE_CORTEX_AVAILABLE}")
+    
     if not SNOWFLAKE_CORTEX_AVAILABLE:
-        return payload
+        log.info("Snowflake Cortex Search not available, skipping")
+        return payload, False
     
     if "messages" not in payload:
-        return payload
+        log.info("No messages in payload, skipping Snowflake search")
+        return payload, False
     
     # 提取最后一个用户消息作为搜索查询
     user_query = None
@@ -145,7 +149,7 @@ async def enhance_payload_with_snowflake_search(payload: dict) -> dict:
     
     # 如果没有找到用户消息，直接返回
     if not user_query or user_message_index is None:
-        return payload
+        return payload, False
     
     try:
         # 执行 Snowflake Cortex Search
@@ -181,14 +185,86 @@ async def enhance_payload_with_snowflake_search(payload: dict) -> dict:
                 payload["messages"][user_message_index]["content"] = new_content
             
             log.info("Successfully enhanced payload with Snowflake Cortex Search results")
+            return payload, True
         else:
             log.debug("No Snowflake Cortex Search results found")
+            return payload, False
             
     except Exception as e:
         log.error(f"Error enhancing payload with Snowflake Cortex Search: {e}")
         # 即使搜索失败，也继续处理原始请求
+        return payload, False
+
+
+def add_knowledge_base_marker_to_stream(stream, marker: str):
+    """
+    在流式响应的第一个内容 chunk 前添加知识库引用标记
     
-    return payload
+    Args:
+        stream: 原始流
+        marker: 要添加的标记文本
+        
+    Returns:
+        修改后的流生成器
+    """
+    async def enhanced_stream():
+        first_content_chunk = True
+        marker_sent = False
+        
+        async for chunk in stream:
+            # 跳过空行和 metadata 行
+            if not chunk or chunk.strip() == b"":
+                yield chunk
+                continue
+            
+            chunk_str = chunk.decode('utf-8', errors='ignore') if isinstance(chunk, bytes) else chunk
+            
+            # 检查是否是内容 chunk (data: {"choices":...})
+            if chunk_str.startswith("data: ") and '"content"' in chunk_str:
+                if first_content_chunk and not marker_sent:
+                    try:
+                        # 解析 JSON
+                        data_str = chunk_str[6:]  # 移除 "data: " 前缀
+                        if data_str.strip() and data_str.strip() != "[DONE]":
+                            data = json.loads(data_str)
+                            # 在第一个内容 chunk 前添加标记
+                            if "choices" in data and len(data["choices"]) > 0:
+                                choice = data["choices"][0]
+                                if "delta" in choice and "content" in choice["delta"]:
+                                    # 在内容前添加标记
+                                    original_content = choice["delta"]["content"]
+                                    choice["delta"]["content"] = f"{marker}\n\n{original_content}"
+                                    # 重新编码
+                                    yield f"data: {json.dumps(data)}\n\n".encode('utf-8')
+                                    marker_sent = True
+                                    first_content_chunk = False
+                                    continue
+                    except (json.JSONDecodeError, KeyError) as e:
+                        log.debug(f"Error parsing chunk for marker: {e}")
+            
+            yield chunk
+            first_content_chunk = False
+    
+    return enhanced_stream()
+
+
+def add_knowledge_base_marker_to_response(response: dict, marker: str) -> dict:
+    """
+    在非流式响应的内容前添加知识库引用标记
+    
+    Args:
+        response: 响应字典
+        marker: 要添加的标记文本
+        
+    Returns:
+        修改后的响应
+    """
+    if isinstance(response, dict) and "choices" in response:
+        for choice in response.get("choices", []):
+            if "message" in choice and "content" in choice["message"]:
+                original_content = choice["message"]["content"]
+                choice["message"]["content"] = f"{marker}\n\n{original_content}"
+    return response
 
 
 def openai_reasoning_model_handler(payload):
@@ -903,6 +979,11 @@ async def generate_chat_completion(
     payload = {**form_data}
     metadata = payload.pop("metadata", None)
 
+    # 初始化 Snowflake Cortex Search 相关变量
+    snowflake_search_used = False
+
+    knowledge_base_marker = "📚 **Referenced Knowledge Base**\n\n*This answer is generated based on the knowledge base content retrieved from project and pond.*"
+
     model_id = form_data.get("model")
     model_info = Models.get_model_by_id(model_id)
 
@@ -919,9 +1000,11 @@ async def generate_chat_completion(
 
             payload = apply_model_params_to_body_openai(params, payload)
             payload = apply_system_prompt_to_body(system, payload, metadata, user)
-            
-            # 使用 Snowflake Cortex Search 增强 payload
-            payload = await enhance_payload_with_snowflake_search(payload)
+        
+        # 无论是否有 params，都尝试使用 Snowflake Cortex Search
+        log.info(f"About to call enhance_payload_with_snowflake_search, model_id={model_id}")
+        payload, snowflake_search_used = await enhance_payload_with_snowflake_search(payload)
+        log.info(f"Snowflake search result: used={snowflake_search_used}")
 
         # Check if user has access to the model
         if not bypass_filter and user.role == "user":
@@ -941,6 +1024,15 @@ async def generate_chat_completion(
                 status_code=403,
                 detail="Model not found",
             )
+        # 即使没有 model_info，也尝试使用 Snowflake Cortex Search
+        log.info(f"About to call enhance_payload_with_snowflake_search (no model_info), model_id={model_id}")
+        payload, snowflake_search_used = await enhance_payload_with_snowflake_search(payload)
+        log.info(f"Snowflake search result: used={snowflake_search_used}")
+    else:
+        # 即使没有 model_info，也尝试使用 Snowflake Cortex Search
+        log.info(f"About to call enhance_payload_with_snowflake_search (bypass_filter), model_id={model_id}")
+        payload, snowflake_search_used = await enhance_payload_with_snowflake_search(payload)
+        log.info(f"Snowflake search result: used={snowflake_search_used}")
 
     await get_all_models(request, user=user)
     model = request.app.state.OPENAI_MODELS.get(model_id)
@@ -1058,8 +1150,17 @@ async def generate_chat_completion(
         # Check if response is SSE
         if "text/event-stream" in r.headers.get("Content-Type", ""):
             streaming = True
+            # 如果使用了 Snowflake Cortex Search，在流式响应中添加标记
+            if snowflake_search_used:
+                stream = add_knowledge_base_marker_to_stream(
+                    stream_chunks_handler(r.content),
+                    knowledge_base_marker
+                )
+            else:
+                stream = stream_chunks_handler(r.content)
+            
             return StreamingResponse(
-                stream_chunks_handler(r.content),
+                stream,
                 status_code=r.status,
                 headers=dict(r.headers),
                 background=BackgroundTask(
@@ -1078,6 +1179,10 @@ async def generate_chat_completion(
                     return JSONResponse(status_code=r.status, content=response)
                 else:
                     return PlainTextResponse(status_code=r.status, content=response)
+
+            # 如果使用了 Snowflake Cortex Search，在非流式响应中添加标记
+            if snowflake_search_used and isinstance(response, dict):
+                response = add_knowledge_base_marker_to_response(response, knowledge_base_marker)
 
             return response
     except Exception as e:
